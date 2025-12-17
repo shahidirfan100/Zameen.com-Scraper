@@ -1,13 +1,239 @@
 import { Actor, log } from 'apify';
-import { CheerioCrawler, Dataset } from 'crawlee';
+import { Dataset, HttpCrawler } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 
 const DEFAULT_START_URL = 'https://www.zameen.com/Homes/Islamabad_DHA_Defence-3188-1.html';
+const USE_ALGOLIA_API = true;
+const MAX_CONCURRENCY = 10;
+const MAX_REQUESTS_PER_MINUTE = 300;
+
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+];
+
+const pickUserAgent = (session) => {
+    const idx = session?.id ? Math.abs([...session.id].reduce((a, c) => a + c.charCodeAt(0), 0)) % USER_AGENTS.length : 0;
+    return USER_AGENTS[idx];
+};
+
+const safeParseJson = (text) => {
+    if (!text) return null;
+    try { return JSON.parse(text); } catch { return null; }
+};
+
+const normalizeUrl = (href, base) => {
+    if (!href) return null;
+    try {
+        const normalized = new URL(href, base || 'https://www.zameen.com').href;
+        return normalized.split('#')[0];
+    } catch {
+        return null;
+    }
+};
 
 const isPropertyDetailUrl = (urlString) => {
     if (!urlString) return false;
     const u = String(urlString);
     return /https?:\/\/www\.zameen\.com\//i.test(u) && /\/Property\//i.test(u) && /-\d+\.html($|\?)/i.test(u);
+};
+
+const inferListPageNoFromUrl = (urlString) => {
+    const u = String(urlString || '');
+    const match = u.match(/-(\d+)\.html(?:$|\?)/i);
+    return match ? Math.max(1, Number(match[1])) : 1;
+};
+
+const extractJsonObjectAfterMarker = (text, marker) => {
+    if (!text) return null;
+    const idx = String(text).indexOf(marker);
+    if (idx === -1) return null;
+    const start = String(text).indexOf('{', idx);
+    if (start === -1) return null;
+
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let i = start; i < text.length; i++) {
+        const ch = text[i];
+        if (inString) {
+            if (escape) escape = false;
+            else if (ch === '\\') escape = true;
+            else if (ch === '"') inString = false;
+            continue;
+        }
+        if (ch === '"') {
+            inString = true;
+            continue;
+        }
+        if (ch === '{') depth++;
+        if (ch === '}') {
+            depth--;
+            if (depth === 0) return text.slice(start, i + 1);
+        }
+    }
+    return null;
+};
+
+const parseWindowState = (html) => {
+    const raw = extractJsonObjectAfterMarker(html, 'window.state =');
+    return raw ? safeParseJson(raw) : null;
+};
+
+const cleanText = (htmlOrText) => {
+    if (!htmlOrText) return '';
+    const s = String(htmlOrText);
+    if (!/[<>]/.test(s)) return s.replace(/\s+/g, ' ').trim();
+    const $ = cheerioLoad(s);
+    $('script, style, noscript, iframe').remove();
+    return $.root().text().replace(/\s+/g, ' ').trim();
+};
+
+const numberFrom = (value) => {
+    if (value === null || value === undefined) return null;
+    const match = String(value).replace(/[,\s]/g, ' ').match(/(-?\d+(?:\.\d+)?)/);
+    return match ? Number(match[1]) : null;
+};
+
+const pickNumber = (...values) => {
+    for (const v of values) {
+        const n = numberFrom(v);
+        if (Number.isFinite(n)) return n;
+    }
+    return null;
+};
+
+const toPurpose = (purpose) => {
+    const p = String(purpose || '').toLowerCase();
+    if (p === 'for-sale' || p === 'sale') return 'sale';
+    if (p === 'for-rent' || p === 'rent') return 'rent';
+    return null;
+};
+
+const toPropertyType = (categoryArray) => {
+    const categories = Array.isArray(categoryArray) ? categoryArray : [];
+    const leaf = categories.find((c) => c?.level === 1) || categories[1] || categories[categories.length - 1];
+    const type = leaf?.nameSingular || leaf?.name || leaf?.slug || null;
+    return type ? String(type).toLowerCase().replace(/_property$/i, '').replace(/\s+/g, ' ').trim() : null;
+};
+
+const locationFromHierarchy = (locationArray) => {
+    const locs = Array.isArray(locationArray) ? locationArray : [];
+    const city = locs.find((x) => x?.level === 2)?.name || null;
+    const parts = locs
+        .filter((x) => x?.level >= 3 && x?.name)
+        .map((x) => String(x.name).trim())
+        .filter(Boolean);
+    const locationText = parts.length ? parts.join(', ') : null;
+    return { city, location: locationText };
+};
+
+const normalizeArea = (areaSqm) => {
+    const sqm = Number(areaSqm);
+    if (!Number.isFinite(sqm) || sqm <= 0) return { area: null, area_unit: null };
+
+    const sqft = sqm * 10.76391041671;
+    const marla = sqft / 225;
+    const kanal = marla / 20;
+
+    const nearInt = (value, tolerance = 0.08) => Math.abs(value - Math.round(value)) <= tolerance;
+
+    if (kanal >= 1 && nearInt(kanal)) return { area: Math.round(kanal), area_unit: 'kanal' };
+    if (marla >= 1 && marla < 20 && nearInt(marla)) return { area: Math.round(marla), area_unit: 'marla' };
+
+    if (sqft >= 1 && Math.abs(sqft - Math.round(sqft)) <= 2) return { area: Math.round(sqft), area_unit: 'sqft' };
+    return { area: Math.round(sqm * 100) / 100, area_unit: 'sqm' };
+};
+
+const toDetailUrlFromHit = (hit) => {
+    const urlCandidate = hit?.link || hit?.url;
+    if (urlCandidate) {
+        const normalized = normalizeUrl(urlCandidate, 'https://www.zameen.com/');
+        if (normalized && isPropertyDetailUrl(normalized)) return normalized;
+    }
+    const slug = hit?.slug;
+    if (!slug) return null;
+    const s = String(slug).replace(/^\/+/, '');
+    const full = `https://www.zameen.com/Property/${s}.html`;
+    return isPropertyDetailUrl(full) ? full : null;
+};
+
+const buildAlgoliaFilters = (filtersObject) => {
+    const filters = filtersObject && typeof filtersObject === 'object' ? filtersObject : {};
+
+    const normalizeValue = (v) => {
+        if (v === null || v === undefined) return null;
+        if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v;
+        if (typeof v === 'object') return v.slug || v.externalID || v.name || null;
+        return String(v);
+    };
+
+    const quote = (v) => {
+        if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+        const s = String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        return `"${s}"`;
+    };
+
+    const pieces = [];
+    for (const [key, f] of Object.entries(filters)) {
+        if (!f?.active) continue;
+        if (key === 'page') continue;
+        const attribute = f.attribute || key;
+
+        const rawValue = f.value;
+        const values = [];
+        if (Array.isArray(rawValue)) {
+            rawValue.forEach((x) => {
+                const v = normalizeValue(x);
+                if (v !== null && v !== undefined && String(v).trim()) values.push(v);
+            });
+        } else {
+            const v = normalizeValue(rawValue);
+            if (v !== null && v !== undefined && String(v).trim()) values.push(v);
+        }
+
+        if (!values.length) continue;
+        const joiner = f.selectionType === 'union' ? 'OR' : 'AND';
+        const expressions = values.map((v) => `${attribute}:${quote(v)}`);
+        if (expressions.length === 1) pieces.push(expressions[0]);
+        else pieces.push(`(${expressions.join(` ${joiner} `)})`);
+    }
+
+    return pieces.join(' AND ');
+};
+
+const buildAlgoliaRequest = ({ appId, apiKey, indexName, filtersStr, pageNo, hitsPerPage }) => {
+    const url = `https://${appId}-dsn.algolia.net/1/indexes/${encodeURIComponent(indexName)}/query`;
+    const pageIndex = Math.max(0, Number(pageNo) - 1);
+    const params = new URLSearchParams({
+        query: '',
+        hitsPerPage: String(hitsPerPage),
+        page: String(pageIndex),
+    });
+    if (filtersStr) params.set('filters', filtersStr);
+
+    return {
+        url,
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            'x-algolia-api-key': String(apiKey),
+            'x-algolia-application-id': String(appId),
+        },
+        payload: JSON.stringify({ params: params.toString() }),
+    };
+};
+
+const looksBlocked = (html) => {
+    const t = String(html || '').toLowerCase();
+    return (
+        t.includes('recaptcha') ||
+        t.includes('g-recaptcha') ||
+        t.includes('captcha') ||
+        t.includes('access denied') ||
+        t.includes('pardon our interruption')
+    );
 };
 
 await Actor.init();
@@ -38,438 +264,341 @@ async function main() {
         const initial = [];
         if (Array.isArray(startUrls) && startUrls.length) initial.push(...startUrls.map(String));
         if (!initial.length && (keyword || location)) initial.push(buildSearchUrl(keyword, location));
-        if (!initial.length) initial.push(DEFAULT_START_URL);
+        if (!initial.length) {
+            log.warning(`No start URLs or keyword/location provided; falling back to ${DEFAULT_START_URL}`);
+            initial.push(DEFAULT_START_URL);
+        }
 
         const proxyConf = proxyConfiguration ? await Actor.createProxyConfiguration({ ...proxyConfiguration }) : undefined;
+        const requestQueue = await Actor.openRequestQueue();
 
         let saved = 0;
-        const seen = new Set();
+        let reserved = 0; // how many listings we decided to output (queued or already output)
+        const MAX_RESERVATIONS = scrapeDetails ? RESULTS_WANTED + Math.min(50, Math.ceil(RESULTS_WANTED * 0.2)) : RESULTS_WANTED;
+        const seenDetail = new Set(); // externalID or URL
+        const seenPages = new Set(); // list/API pagination dedupe
 
-        const normalizeUrl = (href, base) => {
-            if (!href) return null;
-            try {
-                const normalized = new URL(href, base || 'https://www.zameen.com').href;
-                return normalized.split('#')[0];
-            } catch (err) {
-                return null;
-            }
+        const enqueueDetail = async ({ url, externalId, partial }) => {
+            const uniqueKey = externalId ? `detail:${externalId}` : url;
+            if (seenDetail.has(uniqueKey)) return;
+            if (reserved >= MAX_RESERVATIONS) return;
+            seenDetail.add(uniqueKey);
+            reserved++;
+            await requestQueue.addRequest({ url, userData: { label: 'DETAIL', partial }, uniqueKey });
         };
 
-        const safeParseJson = (text) => {
-            if (!text) return null;
-            try { return JSON.parse(text); } catch (err) { return null; }
-        };
+        const enqueueNextAlgoliaPageIfNeeded = async (algoliaConfig, nextPageNo) => {
+            if (!USE_ALGOLIA_API) return false;
+            if (!algoliaConfig?.appId || !algoliaConfig?.apiKey || !algoliaConfig?.indexName) return false;
+            if (nextPageNo > MAX_PAGES) return false;
+            if (reserved >= MAX_RESERVATIONS) return false;
 
-        const cleanText = (html) => {
-            if (!html) return '';
-            const $ = cheerioLoad(html);
-            $('script, style, noscript, iframe').remove();
-            return $.root().text().replace(/\s+/g, ' ').trim();
-        };
+            const signature = `${algoliaConfig.indexName}|${algoliaConfig.filtersStr}|${algoliaConfig.hitsPerPage}|${nextPageNo}`;
+            if (seenPages.has(signature)) return false;
+            seenPages.add(signature);
 
-        const textFrom = ($ctx, selectors = []) => {
-            for (const sel of selectors) {
-                const value = $ctx(sel).first().text().trim();
-                if (value) return value;
-            }
-            return '';
-        };
-
-        const htmlFrom = ($ctx, selectors = []) => {
-            for (const sel of selectors) {
-                const node = $ctx(sel).first();
-                if (node && node.length) {
-                    const html = node.html();
-                    if (html) return String(html).trim();
-                }
-            }
-            return '';
-        };
-
-        const numberFrom = (value) => {
-            if (value === null || value === undefined) return null;
-            const match = String(value).replace(/[,\s]/g, ' ').match(/(-?\d+(?:\.\d+)?)/);
-            return match ? Number(match[1]) : null;
-        };
-
-        const parseArea = (text) => {
-            if (!text) return { area: null, area_unit: null };
-            const match = String(text).match(/(\d+[\d.,]*)\s*(sq\.?\s*ft|sq\.?\s*yd|sq\.?\s*m|sqm|sqft|sqyd|marla|kanal)/i);
-            if (!match) return { area: null, area_unit: null };
-            return { area: numberFrom(match[1]), area_unit: match[2].replace(/\s+/g, ' ').toLowerCase() };
-        };
-
-        const extractMeta = ($ctx, nameOrProperty) => {
-            const v1 = $ctx(`meta[name="${nameOrProperty}"]`).attr('content');
-            if (v1) return String(v1).trim();
-            const v2 = $ctx(`meta[property="${nameOrProperty}"]`).attr('content');
-            if (v2) return String(v2).trim();
-            return '';
-        };
-
-        const findObjectWithHintKeys = (root, hintKeys, maxNodes = 8000) => {
-            if (!root || typeof root !== 'object') return null;
-            const hints = new Set(hintKeys.map((k) => String(k).toLowerCase()));
-            const stack = [root];
-            let visited = 0;
-            while (stack.length && visited < maxNodes) {
-                const node = stack.pop();
-                visited++;
-                if (!node || typeof node !== 'object') continue;
-                const keys = Object.keys(node);
-                const hitCount = keys.reduce((acc, k) => acc + (hints.has(String(k).toLowerCase()) ? 1 : 0), 0);
-                if (hitCount >= 5) return node;
-                for (const k of keys) {
-                    const v = node[k];
-                    if (v && typeof v === 'object') stack.push(v);
-                }
-            }
-            return null;
-        };
-
-        const findBestListingCandidate = (root, maxNodes = 12000) => {
-            if (!root || typeof root !== 'object') return null;
-
-            const stack = [root];
-            let visited = 0;
-            let best = null;
-            let bestScore = 0;
-
-            const scoreNode = (node) => {
-                if (!node || typeof node !== 'object') return 0;
-                const has = (k) => Object.prototype.hasOwnProperty.call(node, k) && node[k] !== null && node[k] !== undefined;
-                const keys = new Set(Object.keys(node).map((k) => String(k).toLowerCase()));
-
-                let score = 0;
-                if (has('price') || keys.has('price')) score += 3;
-                if (has('currency') || has('priceCurrency') || keys.has('currency') || keys.has('pricecurrency')) score += 3;
-                if (has('bedrooms') || has('beds') || keys.has('bedrooms') || keys.has('beds')) score += 3;
-                if (has('bathrooms') || has('baths') || keys.has('bathrooms') || keys.has('baths')) score += 3;
-                if (has('area') || has('areaValue') || has('area_value') || keys.has('area') || keys.has('areavalue')) score += 3;
-                if (has('areaUnit') || has('area_unit') || keys.has('areaunit') || keys.has('area_unit')) score += 2;
-                if (has('location') || has('address') || has('addressTitle') || keys.has('location') || keys.has('address') || keys.has('addresstitle')) score += 2;
-                if (has('city') || has('cityName') || keys.has('city') || keys.has('cityname')) score += 2;
-                if (has('description') || has('Description') || keys.has('description')) score += 2;
-
-                // Discount obvious non-listing nodes.
-                if (keys.has('routes') || keys.has('webpack') || keys.has('buildid')) score -= 5;
-                return score;
-            };
-
-            while (stack.length && visited < maxNodes) {
-                const node = stack.pop();
-                visited++;
-                if (!node || typeof node !== 'object') continue;
-
-                const score = scoreNode(node);
-                if (score > bestScore) {
-                    bestScore = score;
-                    best = node;
-                }
-
-                for (const v of Object.values(node)) {
-                    if (v && typeof v === 'object') stack.push(v);
-                }
-            }
-
-            return bestScore >= 8 ? best : null;
-        };
-
-        const extractNextData = ($ctx) => {
-            const raw = $ctx('script#__NEXT_DATA__').contents().text();
-            return safeParseJson(raw);
-        };
-
-        const pickFirst = (...values) => {
-            for (const v of values) {
-                if (v === undefined || v === null) continue;
-                const s = String(v).trim();
-                if (s) return s;
-            }
-            return '';
-        };
-
-        const pickNumber = (...values) => {
-            for (const v of values) {
-                const n = numberFrom(v);
-                if (Number.isFinite(n)) return n;
-            }
-            return null;
-        };
-
-        const regexPick = (htmlText, regex) => {
-            if (!htmlText) return '';
-            const m = String(htmlText).match(regex);
-            return m?.[1] ? String(m[1]).trim() : '';
-        };
-
-        const inferPurpose = (urlString, text) => {
-            const candidate = `${urlString || ''} ${text || ''}`.toLowerCase();
-            if (/(rent|rental)/i.test(candidate)) return 'rent';
-            if (/(sale|buy|purchase)/i.test(candidate)) return 'sale';
-            return null;
-        };
-
-        const inferPropertyType = (urlString, text) => {
-            const candidate = `${urlString || ''} ${text || ''}`.toLowerCase();
-            if (/apartment|flat/.test(candidate)) return 'apartment';
-            if (/house|home|villa/.test(candidate)) return 'house';
-            if (/plot|land/.test(candidate)) return 'plot';
-            if (/office|commercial/.test(candidate)) return 'commercial';
-            return null;
-        };
-
-        const extractFromJsonLd = ($ctx) => {
-            const scripts = $ctx('script[type="application/ld+json"]');
-            for (let i = 0; i < scripts.length; i++) {
-                const raw = $ctx(scripts[i]).contents().text();
-                const parsed = safeParseJson(raw);
-                const candidates = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
-                for (const node of candidates) {
-                    if (!node || typeof node !== 'object') continue;
-                    const type = node['@type'] || node.type;
-                    if (type === 'Product' || type === 'RealEstateListing' || (Array.isArray(type) && type.includes('Product'))) {
-                        return node;
-                    }
-                    if ((type === 'ItemList' || type === 'CollectionPage') && Array.isArray(node.itemListElement)) {
-                        // Skip list pages here; handled elsewhere.
-                        continue;
-                    }
-                }
-            }
-            return null;
-        };
-
-        const extractListFromItemList = ($ctx, base) => {
-            const urls = new Set();
-            const scripts = $ctx('script[type="application/ld+json"]');
-            scripts.each((_, script) => {
-                const raw = $ctx(script).contents().text();
-                const parsed = safeParseJson(raw);
-                const nodes = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
-                nodes.forEach((node) => {
-                    if (!node || typeof node !== 'object') return;
-                    const type = node['@type'] || node.type;
-                    if (type === 'ItemList' || type === 'CollectionPage') {
-                        (node.itemListElement || []).forEach((item) => {
-                            const urlCandidate = item?.url || item?.item?.url;
-                            const abs = normalizeUrl(urlCandidate, base);
-                            if (abs && isPropertyDetailUrl(abs)) urls.add(abs);
-                        });
-                    }
-                });
+            const req = buildAlgoliaRequest({
+                appId: algoliaConfig.appId,
+                apiKey: algoliaConfig.apiKey,
+                indexName: algoliaConfig.indexName,
+                filtersStr: algoliaConfig.filtersStr,
+                pageNo: nextPageNo,
+                hitsPerPage: algoliaConfig.hitsPerPage,
             });
-            return [...urls];
-        };
 
-        const collectDetailLinksFromHtml = ($ctx, base) => {
-            const urls = new Set();
-            $ctx('a[href]').each((_, a) => {
-                const href = $ctx(a).attr('href');
-                if (!href) return;
-                const normalized = normalizeUrl(href, base);
-                if (!normalized) return;
-                if (!/zameen\.com/i.test(normalized)) return;
-                if (/(blog|guide|news|about|contact)/i.test(normalized)) return;
-                if (/\/Property\//i.test(normalized) && /-\d+\.html$/i.test(normalized)) {
-                    urls.add(normalized);
-                }
+            await requestQueue.addRequest({
+                url: req.url,
+                method: req.method,
+                headers: req.headers,
+                payload: req.payload,
+                userData: { label: 'ALGOLIA', pageNo: nextPageNo, algoliaConfig },
+                uniqueKey: `algolia:${signature}`,
             });
-            return [...urls];
+
+            return true;
         };
 
-        const findNextPage = ($ctx, base) => {
-            const rel = $ctx('a[rel="next"], link[rel="next"]').attr('href');
-            if (rel) return normalizeUrl(rel, base);
-            const candidate = $ctx('a').filter((_, el) => /(next|»|›)/i.test($ctx(el).text())).first().attr('href');
-            if (candidate) return normalizeUrl(candidate, base);
-            const iconNext = $ctx('a[title*="Next"], a[aria-label*="Next"], .pagination a').filter((_, el) => /(next|»|›)/i.test($ctx(el).text() || $ctx(el).attr('title') || '')).first().attr('href');
-            if (iconNext) return normalizeUrl(iconNext, base);
-            return null;
-        };
+        for (const uRaw of initial) {
+            const u = String(uRaw);
+            const pageNo = isPropertyDetailUrl(u) ? 1 : inferListPageNoFromUrl(u);
+            await requestQueue.addRequest({
+                url: u,
+                userData: isPropertyDetailUrl(u) ? { label: 'DETAIL' } : { label: 'LIST', pageNo },
+                uniqueKey: u,
+            });
+        }
 
-        const buildDetailItem = ({ $, html, url: pageUrl }) => {
-            if (!isPropertyDetailUrl(pageUrl)) return null;
-
-            const jsonLd = extractFromJsonLd($) || {};
-
-            const nextData = extractNextData($);
-            const hinted =
-                findBestListingCandidate(nextData) ||
-                findObjectWithHintKeys(nextData, [
-                    'price', 'currency', 'priceCurrency', 'bedrooms', 'beds', 'bathrooms', 'baths',
-                    'area', 'areaUnit', 'area_unit', 'location', 'address', 'city', 'description',
-                ]);
-
-            const priceRaw = jsonLd?.offers?.price ?? textFrom($, ['[itemprop="price"]', '[aria-label*="Price"]', '.price', '[class*="price"]', '[data-cy*="price"]']);
-            const areaRaw =
-                jsonLd?.floorSize?.value ||
-                jsonLd?.floorSize?.text ||
-                hinted?.area ||
-                hinted?.area_value ||
-                hinted?.areaValue ||
-                hinted?.propertyArea ||
-                hinted?.propertySize ||
-                textFrom($, ['[class*="area"]', '[data-testid*="area"]', '.size', '[class*="size"]', '[data-cy*="area"]', '[class*="sq"]']) ||
-                regexPick(html, /\b(?:Area|Size)\b\s*[:\-]?\s*([^<\n]+?\b(?:marla|kanal|sq\.?\s*ft|sq\.?\s*yd|sqm)\b)/i);
-
-            const parsedArea = parseArea(areaRaw);
-            const areaFromState = pickNumber(hinted?.area, hinted?.areaValue, hinted?.area_value);
-            const unitFromState = pickFirst(hinted?.areaUnit, hinted?.area_unit, hinted?.unit);
-            const area = parsedArea.area ?? areaFromState;
-            const area_unit = parsedArea.area_unit || unitFromState || null;
-
-            const bedroomsRaw = pickFirst(
-                jsonLd?.numberOfRooms,
-                jsonLd?.numberOfRooms?.value,
-                hinted?.bedrooms,
-                hinted?.beds,
-                hinted?.bedroom,
-                textFrom($, ['[class*="bed" i]', '[data-testid*="bed" i]', '[class*="bedroom"]', '[data-cy*="bed"]']),
-                regexPick(html, /\b(?:Beds?|Bedrooms?)\b\s*[:\-]?\s*(\d+)/i)
-            );
-
-            const bathroomsRaw = pickFirst(
-                jsonLd?.numberOfBathroomsTotal,
-                jsonLd?.numberOfBathroomsTotal?.value,
-                hinted?.bathrooms,
-                hinted?.baths,
-                hinted?.bathroom,
-                textFrom($, ['[class*="bath" i]', '[data-testid*="bath" i]', '[class*="bathroom"]', '[data-cy*="bath"]']),
-                regexPick(html, /\b(?:Baths?|Bathrooms?)\b\s*[:\-]?\s*(\d+)/i)
-            );
-
-            const title = jsonLd?.name || textFrom($, ['h1', 'title', '[class*="title"]']);
-            const location =
-                jsonLd?.address?.streetAddress ||
-                jsonLd?.address?.addressLocality ||
-                hinted?.location ||
-                hinted?.address ||
-                hinted?.addressTitle ||
-                hinted?.locationTitle ||
-                hinted?.locationName ||
-                textFrom($, ['[class*="location" i]', '[data-testid*="location" i]', '[class*="address"]', '[data-cy*="location"]']) ||
-                '';
-
-            const city =
-                jsonLd?.address?.addressLocality ||
-                jsonLd?.address?.addressRegion ||
-                hinted?.city?.name ||
-                hinted?.cityName ||
-                hinted?.city ||
-                textFrom($, ['[class*="city"]', '[data-cy*="city"]']) ||
-                null;
-
-            const descriptionCandidate =
-                jsonLd?.description ||
-                hinted?.description ||
-                hinted?.Description ||
-                hinted?.propertyDescription ||
-                extractMeta($, 'og:description') ||
-                extractMeta($, 'description') ||
-                htmlFrom($, ['[class*="description" i]', '[data-testid*="description" i]', '.listing-description', '.description', '[class*="detail"]', '[data-cy*="description"]']);
-
-            const description_text = cleanText(descriptionCandidate);
-
-            const price = numberFrom(priceRaw);
-            const currency =
-                jsonLd?.offers?.priceCurrency ||
-                hinted?.currency ||
-                hinted?.currencyCode ||
-                hinted?.priceCurrency ||
-                (/rs|pkr/i.test(String(priceRaw || '')) ? 'PKR' : null);
-
-            const bedrooms = pickNumber(bedroomsRaw);
-            const bathrooms = pickNumber(bathroomsRaw);
-            const purpose = inferPurpose(pageUrl, html);
-            const property_type = inferPropertyType(pageUrl, `${title} ${description_text}`);
-
-            return {
-                title: title || null,
-                price: price ?? null,
-                currency: currency || null,
-                bedrooms: bedrooms ?? null,
-                bathrooms: bathrooms ?? null,
-                area: area ?? null,
-                area_unit: area_unit || null,
-                location: location || null,
-                city: city || null,
-                property_type: property_type || null,
-                purpose: purpose || null,
-                Description: description_text || null,
-                url: pageUrl,
-                source: 'zameen.com',
-            };
-        };
-
-        const crawler = new CheerioCrawler({
+        const crawler = new HttpCrawler({
+            requestQueue,
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 5,
             useSessionPool: true,
-            maxConcurrency: 5,
-            requestHandlerTimeoutSecs: 120,
-            async requestHandler({ request, body, $, enqueueLinks, log: crawlerLog }) {
+            maxRequestRetries: 6,
+            maxConcurrency: MAX_CONCURRENCY,
+            maxRequestsPerMinute: MAX_REQUESTS_PER_MINUTE,
+            requestHandlerTimeoutSecs: 180,
+            preNavigationHooks: [
+                async ({ request, session }, gotOptions) => {
+                    gotOptions.headers ??= {};
+                    gotOptions.headers['user-agent'] = pickUserAgent(session);
+                    gotOptions.headers['accept-language'] = 'en-US,en;q=0.9';
+                    const label = request.userData?.label || 'LIST';
+                    if (label === 'ALGOLIA') {
+                        gotOptions.headers.accept ??= 'application/json,text/plain,*/*';
+                    } else {
+                        gotOptions.headers.accept ??= 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8';
+                    }
+                    gotOptions.followRedirect = true;
+                    gotOptions.timeout = { request: 30000 };
+                },
+            ],
+            async requestHandler({ request, body, response, session, log: crawlerLog }) {
                 const label = request.userData?.label || 'LIST';
                 const pageNo = request.userData?.pageNo || 1;
+                const bodyText = body?.toString?.() || '';
+
+                if ((response?.statusCode === 403 || response?.statusCode === 429) && session) {
+                    crawlerLog.warning(`HTTP ${response.statusCode} for ${request.url} (retiring session)`);
+                    session.retire();
+                }
 
                 if (label === 'LIST') {
-                    const apiLinks = extractListFromItemList($, request.url);
-                    const htmlLinks = collectDetailLinksFromHtml($, request.url);
-                    const candidates = [...apiLinks, ...htmlLinks].filter(isPropertyDetailUrl);
-
-                    const remaining = RESULTS_WANTED - saved;
-                    const toProcess = candidates.filter((u) => {
-                        if (!u) return false;
-                        const isNew = !seen.has(u);
-                        if (isNew) seen.add(u);
-                        return isNew;
-                    }).slice(0, Math.max(0, remaining));
-
-                    crawlerLog.info(`LIST ${request.url} -> queued ${toProcess.length} detail URLs (page ${pageNo})`);
-
-                    if (scrapeDetails) {
-                        if (toProcess.length) await enqueueLinks({ urls: toProcess, userData: { label: 'DETAIL' } });
-                    } else if (toProcess.length) {
-                        await Dataset.pushData(toProcess.map((u) => ({ url: u, source: 'zameen.com' })));
-                        saved += toProcess.length;
+                    if (looksBlocked(bodyText) && session) {
+                        crawlerLog.warning(`Blocked/captcha-like response on LIST ${request.url} (retiring session)`);
+                        session.retire();
                     }
 
-                    if (saved < RESULTS_WANTED && pageNo < MAX_PAGES) {
-                        const next = findNextPage($, request.url);
-                        if (next) {
-                            await enqueueLinks({ urls: [next], userData: { label: 'LIST', pageNo: pageNo + 1 } });
-                        } else {
-                            crawlerLog.info(`No next page link detected after page ${pageNo}`);
+                    const $ = cheerioLoad(bodyText);
+                    const state = parseWindowState(bodyText);
+
+                    const hits = state?.algolia?.content?.hits;
+                    const algoliaConfig = state?.algolia
+                        ? {
+                            appId: state.algolia.appId,
+                            apiKey: state.algolia.apiKey,
+                            indexName: state.algolia.indexName,
+                            hitsPerPage: state.algolia.settings?.hitsPerPage || state.algolia.content?.hitsPerPage || 25,
+                            filtersStr: buildAlgoliaFilters(state.algolia.filters),
                         }
+                        : null;
+
+                    const candidates = [];
+
+                    if (Array.isArray(hits) && hits.length) {
+                        hits.forEach((hit) => {
+                            const url = toDetailUrlFromHit(hit);
+                            if (!url) return;
+                            candidates.push({ url, hit });
+                        });
+                    }
+
+                    $('a[href]').each((_, a) => {
+                        const href = $(a).attr('href');
+                        const normalized = normalizeUrl(href, request.url);
+                        if (!normalized) return;
+                        if (!/zameen\.com/i.test(normalized)) return;
+                        if (/(blog|guide|news|about|contact)/i.test(normalized)) return;
+                        if (!isPropertyDetailUrl(normalized)) return;
+                        candidates.push({ url: normalized, hit: null });
+                    });
+
+                    const remaining = MAX_RESERVATIONS - reserved;
+                    const localSeen = new Set();
+                    const uniqueCandidates = [];
+                    for (const c of candidates) {
+                        const externalId = c?.hit?.externalID ? String(c.hit.externalID) : null;
+                        const key = externalId ? `detail:${externalId}` : c?.url;
+                        if (!key) continue;
+                        if (localSeen.has(key)) continue;
+                        if (seenDetail.has(key)) continue;
+                        localSeen.add(key);
+                        uniqueCandidates.push(c);
+                    }
+                    const toQueue = uniqueCandidates.slice(0, Math.max(0, remaining));
+
+                    crawlerLog.info(`LIST page ${pageNo}: discovered=${uniqueCandidates.length}, remaining=${remaining}, willQueue=${toQueue.length}`);
+
+                    if (scrapeDetails) {
+                        for (const { url, hit } of toQueue) {
+                            const externalId = hit?.externalID ? String(hit.externalID) : null;
+                            const { city, location: locationText } = locationFromHierarchy(hit?.location);
+                            const areaNormalized = normalizeArea(hit?.area);
+                            const partial = hit
+                                ? {
+                                    title: hit.title || null,
+                                    price: pickNumber(hit.price) ?? null,
+                                    currency: 'PKR',
+                                    bedrooms: pickNumber(hit.rooms) ?? null,
+                                    bathrooms: pickNumber(hit.baths) ?? null,
+                                    area: areaNormalized.area ?? null,
+                                    area_unit: areaNormalized.area_unit || null,
+                                    location: locationText || null,
+                                    city: city || null,
+                                    purpose: toPurpose(hit.purpose) || null,
+                                    property_type: toPropertyType(hit.category) || null,
+                                    url,
+                                    external_id: externalId,
+                                    source: 'zameen.com',
+                                }
+                                : null;
+                            await enqueueDetail({ url, externalId, partial });
+                        }
+                    } else {
+                        await Dataset.pushData(toQueue.map(({ url }) => ({ url, source: 'zameen.com' })));
+                        saved += toQueue.length;
+                        reserved += toQueue.length;
+                    }
+
+                    if (reserved < MAX_RESERVATIONS && pageNo < MAX_PAGES) {
+                    const enqueued = await enqueueNextAlgoliaPageIfNeeded(algoliaConfig, pageNo + 1);
+                    if (!enqueued) {
+                        const nextHref = $('a[rel="next"], link[rel="next"]').attr('href');
+                        const next = normalizeUrl(nextHref, request.url);
+                            if (next) {
+                                await requestQueue.addRequest({ url: next, userData: { label: 'LIST', pageNo: pageNo + 1 }, uniqueKey: next });
+                            } else {
+                                crawlerLog.info(`LIST page ${pageNo}: no next page detected`);
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                if (label === 'ALGOLIA') {
+                    if (saved >= RESULTS_WANTED) return;
+                    if (reserved >= MAX_RESERVATIONS) return;
+
+                    const parsed = safeParseJson(bodyText);
+                    if (!parsed?.hits || !Array.isArray(parsed.hits)) {
+                        crawlerLog.warning(`ALGOLIA page ${pageNo}: unexpected response, keys=${parsed ? Object.keys(parsed) : 'null'}`);
+                        return;
+                    }
+
+                    const hits = parsed.hits;
+                    const remaining = MAX_RESERVATIONS - reserved;
+                    const uniqueHits = [];
+                    const localSeen = new Set();
+                    for (const hit of hits) {
+                        const externalId = hit?.externalID ? String(hit.externalID) : null;
+                        const url = toDetailUrlFromHit(hit);
+                        const key = externalId ? `detail:${externalId}` : url;
+                        if (!key) continue;
+                        if (localSeen.has(key)) continue;
+                        if (seenDetail.has(key)) continue;
+                        localSeen.add(key);
+                        uniqueHits.push(hit);
+                    }
+                    const toQueue = uniqueHits.slice(0, Math.max(0, remaining));
+                    crawlerLog.info(`ALGOLIA page ${pageNo}: hits=${hits.length}, unique=${uniqueHits.length}, remaining=${remaining}, willQueue=${toQueue.length}`);
+
+                    if (scrapeDetails) {
+                        for (const hit of toQueue) {
+                            const url = toDetailUrlFromHit(hit);
+                            if (!url) continue;
+
+                            const externalId = hit?.externalID ? String(hit.externalID) : null;
+                            const { city, location: locationText } = locationFromHierarchy(hit?.location);
+                            const areaNormalized = normalizeArea(hit?.area);
+                            const partial = {
+                                title: hit.title || null,
+                                price: pickNumber(hit.price) ?? null,
+                                currency: 'PKR',
+                                bedrooms: pickNumber(hit.rooms) ?? null,
+                                bathrooms: pickNumber(hit.baths) ?? null,
+                                area: areaNormalized.area ?? null,
+                                area_unit: areaNormalized.area_unit || null,
+                                location: locationText || null,
+                                city: city || null,
+                                purpose: toPurpose(hit.purpose) || null,
+                                property_type: toPropertyType(hit.category) || null,
+                                url,
+                                external_id: externalId,
+                                source: 'zameen.com',
+                            };
+
+                            await enqueueDetail({ url, externalId, partial });
+                        }
+                    } else {
+                        await Dataset.pushData(toQueue.map((hit) => ({ url: toDetailUrlFromHit(hit), source: 'zameen.com' })).filter((x) => x.url));
+                        saved += toQueue.length;
+                        reserved += toQueue.length;
+                    }
+
+                    const cfg = request.userData?.algoliaConfig;
+                    if (reserved < MAX_RESERVATIONS && pageNo < MAX_PAGES) {
+                        await enqueueNextAlgoliaPageIfNeeded(cfg, pageNo + 1);
                     }
                     return;
                 }
 
                 if (label === 'DETAIL') {
                     if (saved >= RESULTS_WANTED) return;
-                    try {
-                        const html = body?.toString?.() || '';
-                        const item = buildDetailItem({ $, html, url: request.url });
-                        if (!item) {
-                            crawlerLog.info(`DETAIL ${request.url} looked like a listing page; skipping.`);
-                            return;
-                        }
+                    if (!isPropertyDetailUrl(request.url)) return;
+
+                    if (looksBlocked(bodyText) && session) {
+                        crawlerLog.warning(`Blocked/captcha-like response on DETAIL ${request.url} (retiring session)`);
+                        session.retire();
+                    }
+
+                    const state = parseWindowState(bodyText);
+                    const data = state?.property?.data;
+                    const partial = request.userData?.partial || null;
+
+                    if (data && typeof data === 'object' && String(data.externalID || '').trim()) {
+                        const { city, location: locationText } = locationFromHierarchy(data.location);
+                        const areaNormalized = normalizeArea(data.area);
+
+                        const item = {
+                            title: data.title || partial?.title || null,
+                            price: pickNumber(data.price, partial?.price) ?? null,
+                            currency: 'PKR',
+                            bedrooms: pickNumber(data.rooms, partial?.bedrooms) ?? null,
+                            bathrooms: pickNumber(data.baths, partial?.bathrooms) ?? null,
+                            area: areaNormalized.area ?? partial?.area ?? null,
+                            area_unit: areaNormalized.area_unit || partial?.area_unit || null,
+                            location: locationText || partial?.location || null,
+                            city: city || partial?.city || null,
+                            property_type: toPropertyType(data.category) || partial?.property_type || null,
+                            purpose: toPurpose(data.purpose) || partial?.purpose || null,
+                            Description: cleanText(data.description || data.shortDescription || ''),
+                            url: data.link || request.url,
+                            source: 'zameen.com',
+                            external_id: String(data.externalID),
+                        };
 
                         await Dataset.pushData(item);
                         saved++;
-                    } catch (err) {
-                        crawlerLog.error(`DETAIL ${request.url} failed: ${err.message}`);
+                        return;
                     }
+
+                    // HTML fallback (best-effort) if window.state is missing.
+                    const $ = cheerioLoad(bodyText);
+                    const title = $('h1').first().text().trim() || $('title').text().trim() || partial?.title || null;
+                    const description = cleanText(partial?.Description || partial?.description || '');
+                    const item = {
+                        title: title || null,
+                        price: partial?.price ?? null,
+                        currency: partial?.currency || 'PKR',
+                        bedrooms: partial?.bedrooms ?? null,
+                        bathrooms: partial?.bathrooms ?? null,
+                        area: partial?.area ?? null,
+                        area_unit: partial?.area_unit || null,
+                        location: partial?.location || null,
+                        city: partial?.city || null,
+                        property_type: partial?.property_type || null,
+                        purpose: partial?.purpose || null,
+                        Description: description || null,
+                        url: request.url,
+                        source: 'zameen.com',
+                        external_id: partial?.external_id || null,
+                    };
+
+                    await Dataset.pushData(item);
+                    saved++;
                 }
             },
         });
 
-        await crawler.run(
-            initial.map((u) => ({
-                url: u,
-                userData: isPropertyDetailUrl(u) ? { label: 'DETAIL' } : { label: 'LIST', pageNo: 1 },
-            }))
-        );
+        await crawler.run();
         log.info(`Finished. Saved ${saved} items`);
     } finally {
         await Actor.exit();
