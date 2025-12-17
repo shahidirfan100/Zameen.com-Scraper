@@ -4,6 +4,12 @@ import { load as cheerioLoad } from 'cheerio';
 
 const DEFAULT_START_URL = 'https://www.zameen.com/Homes/Islamabad_DHA_Defence-3188-1.html';
 
+const isPropertyDetailUrl = (urlString) => {
+    if (!urlString) return false;
+    const u = String(urlString);
+    return /https?:\/\/www\.zameen\.com\//i.test(u) && /\/Property\//i.test(u) && /-\d+\.html($|\?)/i.test(u);
+};
+
 await Actor.init();
 
 async function main() {
@@ -93,6 +99,110 @@ async function main() {
             return { area: numberFrom(match[1]), area_unit: match[2].replace(/\s+/g, ' ').toLowerCase() };
         };
 
+        const extractMeta = ($ctx, nameOrProperty) => {
+            const v1 = $ctx(`meta[name="${nameOrProperty}"]`).attr('content');
+            if (v1) return String(v1).trim();
+            const v2 = $ctx(`meta[property="${nameOrProperty}"]`).attr('content');
+            if (v2) return String(v2).trim();
+            return '';
+        };
+
+        const findObjectWithHintKeys = (root, hintKeys, maxNodes = 8000) => {
+            if (!root || typeof root !== 'object') return null;
+            const hints = new Set(hintKeys.map((k) => String(k).toLowerCase()));
+            const stack = [root];
+            let visited = 0;
+            while (stack.length && visited < maxNodes) {
+                const node = stack.pop();
+                visited++;
+                if (!node || typeof node !== 'object') continue;
+                const keys = Object.keys(node);
+                const hitCount = keys.reduce((acc, k) => acc + (hints.has(String(k).toLowerCase()) ? 1 : 0), 0);
+                if (hitCount >= 5) return node;
+                for (const k of keys) {
+                    const v = node[k];
+                    if (v && typeof v === 'object') stack.push(v);
+                }
+            }
+            return null;
+        };
+
+        const findBestListingCandidate = (root, maxNodes = 12000) => {
+            if (!root || typeof root !== 'object') return null;
+
+            const stack = [root];
+            let visited = 0;
+            let best = null;
+            let bestScore = 0;
+
+            const scoreNode = (node) => {
+                if (!node || typeof node !== 'object') return 0;
+                const has = (k) => Object.prototype.hasOwnProperty.call(node, k) && node[k] !== null && node[k] !== undefined;
+                const keys = new Set(Object.keys(node).map((k) => String(k).toLowerCase()));
+
+                let score = 0;
+                if (has('price') || keys.has('price')) score += 3;
+                if (has('currency') || has('priceCurrency') || keys.has('currency') || keys.has('pricecurrency')) score += 3;
+                if (has('bedrooms') || has('beds') || keys.has('bedrooms') || keys.has('beds')) score += 3;
+                if (has('bathrooms') || has('baths') || keys.has('bathrooms') || keys.has('baths')) score += 3;
+                if (has('area') || has('areaValue') || has('area_value') || keys.has('area') || keys.has('areavalue')) score += 3;
+                if (has('areaUnit') || has('area_unit') || keys.has('areaunit') || keys.has('area_unit')) score += 2;
+                if (has('location') || has('address') || has('addressTitle') || keys.has('location') || keys.has('address') || keys.has('addresstitle')) score += 2;
+                if (has('city') || has('cityName') || keys.has('city') || keys.has('cityname')) score += 2;
+                if (has('description') || has('Description') || keys.has('description')) score += 2;
+
+                // Discount obvious non-listing nodes.
+                if (keys.has('routes') || keys.has('webpack') || keys.has('buildid')) score -= 5;
+                return score;
+            };
+
+            while (stack.length && visited < maxNodes) {
+                const node = stack.pop();
+                visited++;
+                if (!node || typeof node !== 'object') continue;
+
+                const score = scoreNode(node);
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = node;
+                }
+
+                for (const v of Object.values(node)) {
+                    if (v && typeof v === 'object') stack.push(v);
+                }
+            }
+
+            return bestScore >= 8 ? best : null;
+        };
+
+        const extractNextData = ($ctx) => {
+            const raw = $ctx('script#__NEXT_DATA__').contents().text();
+            return safeParseJson(raw);
+        };
+
+        const pickFirst = (...values) => {
+            for (const v of values) {
+                if (v === undefined || v === null) continue;
+                const s = String(v).trim();
+                if (s) return s;
+            }
+            return '';
+        };
+
+        const pickNumber = (...values) => {
+            for (const v of values) {
+                const n = numberFrom(v);
+                if (Number.isFinite(n)) return n;
+            }
+            return null;
+        };
+
+        const regexPick = (htmlText, regex) => {
+            if (!htmlText) return '';
+            const m = String(htmlText).match(regex);
+            return m?.[1] ? String(m[1]).trim() : '';
+        };
+
         const inferPurpose = (urlString, text) => {
             const candidate = `${urlString || ''} ${text || ''}`.toLowerCase();
             if (/(rent|rental)/i.test(candidate)) return 'rent';
@@ -144,7 +254,7 @@ async function main() {
                         (node.itemListElement || []).forEach((item) => {
                             const urlCandidate = item?.url || item?.item?.url;
                             const abs = normalizeUrl(urlCandidate, base);
-                            if (abs) urls.add(abs);
+                            if (abs && isPropertyDetailUrl(abs)) urls.add(abs);
                         });
                     }
                 });
@@ -179,21 +289,98 @@ async function main() {
         };
 
         const buildDetailItem = ({ $, html, url: pageUrl }) => {
+            if (!isPropertyDetailUrl(pageUrl)) return null;
+
             const jsonLd = extractFromJsonLd($) || {};
+
+            const nextData = extractNextData($);
+            const hinted =
+                findBestListingCandidate(nextData) ||
+                findObjectWithHintKeys(nextData, [
+                    'price', 'currency', 'priceCurrency', 'bedrooms', 'beds', 'bathrooms', 'baths',
+                    'area', 'areaUnit', 'area_unit', 'location', 'address', 'city', 'description',
+                ]);
+
             const priceRaw = jsonLd?.offers?.price ?? textFrom($, ['[itemprop="price"]', '[aria-label*="Price"]', '.price', '[class*="price"]', '[data-cy*="price"]']);
-            const { area, area_unit } = parseArea(jsonLd?.floorSize?.value || jsonLd?.floorSize?.text || textFrom($, ['[class*="area"]', '[data-testid*="area"]', '.size', '[class*="size"]', '[data-cy*="area"]', '[class*="sq"]']));
-            const bedroomsRaw = jsonLd?.numberOfRooms ?? jsonLd?.numberOfRooms?.value ?? textFrom($, ['[class*="bed" i]', '[data-testid*="bed" i]', '[class*="bedroom"]', '[data-cy*="bed"]']);
-            const bathroomsRaw = jsonLd?.numberOfBathroomsTotal ?? jsonLd?.numberOfBathroomsTotal?.value ?? textFrom($, ['[class*="bath" i]', '[data-testid*="bath" i]', '[class*="bathroom"]', '[data-cy*="bath"]']);
+            const areaRaw =
+                jsonLd?.floorSize?.value ||
+                jsonLd?.floorSize?.text ||
+                hinted?.area ||
+                hinted?.area_value ||
+                hinted?.areaValue ||
+                hinted?.propertyArea ||
+                hinted?.propertySize ||
+                textFrom($, ['[class*="area"]', '[data-testid*="area"]', '.size', '[class*="size"]', '[data-cy*="area"]', '[class*="sq"]']) ||
+                regexPick(html, /\b(?:Area|Size)\b\s*[:\-]?\s*([^<\n]+?\b(?:marla|kanal|sq\.?\s*ft|sq\.?\s*yd|sqm)\b)/i);
+
+            const parsedArea = parseArea(areaRaw);
+            const areaFromState = pickNumber(hinted?.area, hinted?.areaValue, hinted?.area_value);
+            const unitFromState = pickFirst(hinted?.areaUnit, hinted?.area_unit, hinted?.unit);
+            const area = parsedArea.area ?? areaFromState;
+            const area_unit = parsedArea.area_unit || unitFromState || null;
+
+            const bedroomsRaw = pickFirst(
+                jsonLd?.numberOfRooms,
+                jsonLd?.numberOfRooms?.value,
+                hinted?.bedrooms,
+                hinted?.beds,
+                hinted?.bedroom,
+                textFrom($, ['[class*="bed" i]', '[data-testid*="bed" i]', '[class*="bedroom"]', '[data-cy*="bed"]']),
+                regexPick(html, /\b(?:Beds?|Bedrooms?)\b\s*[:\-]?\s*(\d+)/i)
+            );
+
+            const bathroomsRaw = pickFirst(
+                jsonLd?.numberOfBathroomsTotal,
+                jsonLd?.numberOfBathroomsTotal?.value,
+                hinted?.bathrooms,
+                hinted?.baths,
+                hinted?.bathroom,
+                textFrom($, ['[class*="bath" i]', '[data-testid*="bath" i]', '[class*="bathroom"]', '[data-cy*="bath"]']),
+                regexPick(html, /\b(?:Baths?|Bathrooms?)\b\s*[:\-]?\s*(\d+)/i)
+            );
+
             const title = jsonLd?.name || textFrom($, ['h1', 'title', '[class*="title"]']);
-            const location = jsonLd?.address?.streetAddress || jsonLd?.address?.addressLocality || textFrom($, ['[class*="location" i]', '[data-testid*="location" i]', '[class*="address"]', '[data-cy*="location"]']);
-            const city = jsonLd?.address?.addressLocality || jsonLd?.address?.addressRegion || textFrom($, ['[class*="city"]', '[data-cy*="city"]']) || null;
-            const description_html = jsonLd?.description || htmlFrom($, ['[class*="description" i]', '[data-testid*="description" i]', '.listing-description', '.description', '[class*="detail"]', '[data-cy*="description"]']);
-            const description_text = cleanText(description_html);
+            const location =
+                jsonLd?.address?.streetAddress ||
+                jsonLd?.address?.addressLocality ||
+                hinted?.location ||
+                hinted?.address ||
+                hinted?.addressTitle ||
+                hinted?.locationTitle ||
+                hinted?.locationName ||
+                textFrom($, ['[class*="location" i]', '[data-testid*="location" i]', '[class*="address"]', '[data-cy*="location"]']) ||
+                '';
+
+            const city =
+                jsonLd?.address?.addressLocality ||
+                jsonLd?.address?.addressRegion ||
+                hinted?.city?.name ||
+                hinted?.cityName ||
+                hinted?.city ||
+                textFrom($, ['[class*="city"]', '[data-cy*="city"]']) ||
+                null;
+
+            const descriptionCandidate =
+                jsonLd?.description ||
+                hinted?.description ||
+                hinted?.Description ||
+                hinted?.propertyDescription ||
+                extractMeta($, 'og:description') ||
+                extractMeta($, 'description') ||
+                htmlFrom($, ['[class*="description" i]', '[data-testid*="description" i]', '.listing-description', '.description', '[class*="detail"]', '[data-cy*="description"]']);
+
+            const description_text = cleanText(descriptionCandidate);
 
             const price = numberFrom(priceRaw);
-            const currency = jsonLd?.offers?.priceCurrency || (/rs|pkr/i.test(String(priceRaw || '')) ? 'PKR' : null);
-            const bedrooms = numberFrom(bedroomsRaw);
-            const bathrooms = numberFrom(bathroomsRaw);
+            const currency =
+                jsonLd?.offers?.priceCurrency ||
+                hinted?.currency ||
+                hinted?.currencyCode ||
+                hinted?.priceCurrency ||
+                (/rs|pkr/i.test(String(priceRaw || '')) ? 'PKR' : null);
+
+            const bedrooms = pickNumber(bedroomsRaw);
+            const bathrooms = pickNumber(bathroomsRaw);
             const purpose = inferPurpose(pageUrl, html);
             const property_type = inferPropertyType(pageUrl, `${title} ${description_text}`);
 
@@ -228,7 +415,7 @@ async function main() {
                 if (label === 'LIST') {
                     const apiLinks = extractListFromItemList($, request.url);
                     const htmlLinks = collectDetailLinksFromHtml($, request.url);
-                    const candidates = [...apiLinks, ...htmlLinks];
+                    const candidates = [...apiLinks, ...htmlLinks].filter(isPropertyDetailUrl);
 
                     const remaining = RESULTS_WANTED - saved;
                     const toProcess = candidates.filter((u) => {
@@ -263,6 +450,11 @@ async function main() {
                     try {
                         const html = body?.toString?.() || '';
                         const item = buildDetailItem({ $, html, url: request.url });
+                        if (!item) {
+                            crawlerLog.info(`DETAIL ${request.url} looked like a listing page; skipping.`);
+                            return;
+                        }
+
                         await Dataset.pushData(item);
                         saved++;
                     } catch (err) {
@@ -272,7 +464,12 @@ async function main() {
             },
         });
 
-        await crawler.run(initial.map((u) => ({ url: u, userData: { label: 'LIST', pageNo: 1 } })));
+        await crawler.run(
+            initial.map((u) => ({
+                url: u,
+                userData: isPropertyDetailUrl(u) ? { label: 'DETAIL' } : { label: 'LIST', pageNo: 1 },
+            }))
+        );
         log.info(`Finished. Saved ${saved} items`);
     } finally {
         await Actor.exit();

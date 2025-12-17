@@ -68,6 +68,10 @@
             "label": "Type",
             "format": "text"
           },
+          "Description": {
+            "label": "Description",
+            "format": "text"
+          },
           "url": {
             "label": "URL",
             "format": "link"
