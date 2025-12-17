@@ -33,16 +33,24 @@ const normalizeUrl = (href, base) => {
     }
 };
 
+const isZameenUrl = (urlString) => /^https?:\/\/(?:www\.)?zameen\.com\//i.test(String(urlString || ''));
+
 const isPropertyDetailUrl = (urlString) => {
     if (!urlString) return false;
     const u = String(urlString);
-    return /https?:\/\/www\.zameen\.com\//i.test(u) && /\/Property\//i.test(u) && /-\d+\.html($|\?)/i.test(u);
+    return /^https?:\/\/(?:www\.)?zameen\.com\/Property\/.+-\d+\.html(?:$|\?)/i.test(u);
 };
 
 const inferListPageNoFromUrl = (urlString) => {
     const u = String(urlString || '');
     const match = u.match(/-(\d+)\.html(?:$|\?)/i);
     return match ? Math.max(1, Number(match[1])) : 1;
+};
+
+const extractZameenPropertyUrlFromText = (text) => {
+    const t = String(text || '');
+    const m = t.match(/https?:\/\/(?:www\.)?zameen\.com\/Property\/[^\s"'<>]+?-\d+\.html/ig);
+    return m?.[0] || null;
 };
 
 const extractJsonObjectAfterMarker = (text, marker) => {
@@ -279,6 +287,7 @@ async function main() {
         const seenPages = new Set(); // list/API pagination dedupe
 
         const enqueueDetail = async ({ url, externalId, partial }) => {
+            if (!isPropertyDetailUrl(url)) return;
             const uniqueKey = externalId ? `detail:${externalId}` : url;
             if (seenDetail.has(uniqueKey)) return;
             if (reserved >= MAX_RESERVATIONS) return;
@@ -320,11 +329,15 @@ async function main() {
 
         for (const uRaw of initial) {
             const u = String(uRaw);
+            if (!isZameenUrl(u) && !extractZameenPropertyUrlFromText(u)) {
+                log.warning(`Skipping non-Zameen start URL: ${u}`);
+                continue;
+            }
             const pageNo = isPropertyDetailUrl(u) ? 1 : inferListPageNoFromUrl(u);
             await requestQueue.addRequest({
-                url: u,
+                url: isZameenUrl(u) ? u : extractZameenPropertyUrlFromText(u),
                 userData: isPropertyDetailUrl(u) ? { label: 'DETAIL' } : { label: 'LIST', pageNo },
-                uniqueKey: u,
+                uniqueKey: isZameenUrl(u) ? u : extractZameenPropertyUrlFromText(u),
             });
         }
 
@@ -395,10 +408,20 @@ async function main() {
                         const href = $(a).attr('href');
                         const normalized = normalizeUrl(href, request.url);
                         if (!normalized) return;
-                        if (!/zameen\.com/i.test(normalized)) return;
-                        if (/(blog|guide|news|about|contact)/i.test(normalized)) return;
-                        if (!isPropertyDetailUrl(normalized)) return;
-                        candidates.push({ url: normalized, hit: null });
+
+                        // Avoid social-share URLs; if they embed a Zameen property URL, extract and crawl the real one.
+                        let candidateUrl = normalized;
+                        if (!isZameenUrl(candidateUrl)) {
+                            const decoded = (() => {
+                                try { return decodeURIComponent(candidateUrl); } catch { return candidateUrl; }
+                            })();
+                            const embedded = extractZameenPropertyUrlFromText(decoded) || extractZameenPropertyUrlFromText(candidateUrl);
+                            if (!embedded) return;
+                            candidateUrl = embedded;
+                        }
+
+                        if (!isPropertyDetailUrl(candidateUrl)) return;
+                        candidates.push({ url: candidateUrl, hit: null });
                     });
 
                     const remaining = MAX_RESERVATIONS - reserved;
