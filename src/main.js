@@ -161,7 +161,7 @@ async function main() {
                 if (!normalized) return;
                 if (!/zameen\.com/i.test(normalized)) return;
                 if (/(blog|guide|news|about|contact)/i.test(normalized)) return;
-                if (/\/Homes\//i.test(normalized) || /\/Property\//i.test(normalized) || /-\d+\.html$/i.test(normalized)) {
+                if (/\/Property\//i.test(normalized) && /-\d+\.html$/i.test(normalized)) {
                     urls.add(normalized);
                 }
             });
@@ -180,14 +180,14 @@ async function main() {
 
         const buildDetailItem = ({ $, html, url: pageUrl }) => {
             const jsonLd = extractFromJsonLd($) || {};
-            const priceRaw = jsonLd?.offers?.price ?? textFrom($, ['[itemprop="price"]', '[aria-label*="Price"]', '.price', '[class*="price"]']);
-            const { area, area_unit } = parseArea(jsonLd?.floorSize?.value || jsonLd?.floorSize?.text || textFrom($, ['[class*="area"]', '[data-testid*="area"]', '.size']));
-            const bedroomsRaw = jsonLd?.numberOfRooms ?? jsonLd?.numberOfRooms?.value ?? textFrom($, ['[class*="bed" i]', '[data-testid*="bed" i]']);
-            const bathroomsRaw = jsonLd?.numberOfBathroomsTotal ?? jsonLd?.numberOfBathroomsTotal?.value ?? textFrom($, ['[class*="bath" i]', '[data-testid*="bath" i]']);
-            const title = jsonLd?.name || textFrom($, ['h1', 'title']);
-            const location = jsonLd?.address?.streetAddress || jsonLd?.address?.addressLocality || textFrom($, ['[class*="location" i]', '[data-testid*="location" i]']);
-            const city = jsonLd?.address?.addressLocality || jsonLd?.address?.addressRegion || null;
-            const description_html = jsonLd?.description || htmlFrom($, ['[class*="description" i]', '[data-testid*="description" i]', '.listing-description', '.description']);
+            const priceRaw = jsonLd?.offers?.price ?? textFrom($, ['[itemprop="price"]', '[aria-label*="Price"]', '.price', '[class*="price"]', '[data-cy*="price"]']);
+            const { area, area_unit } = parseArea(jsonLd?.floorSize?.value || jsonLd?.floorSize?.text || textFrom($, ['[class*="area"]', '[data-testid*="area"]', '.size', '[class*="size"]', '[data-cy*="area"]', '[class*="sq"]']));
+            const bedroomsRaw = jsonLd?.numberOfRooms ?? jsonLd?.numberOfRooms?.value ?? textFrom($, ['[class*="bed" i]', '[data-testid*="bed" i]', '[class*="bedroom"]', '[data-cy*="bed"]']);
+            const bathroomsRaw = jsonLd?.numberOfBathroomsTotal ?? jsonLd?.numberOfBathroomsTotal?.value ?? textFrom($, ['[class*="bath" i]', '[data-testid*="bath" i]', '[class*="bathroom"]', '[data-cy*="bath"]']);
+            const title = jsonLd?.name || textFrom($, ['h1', 'title', '[class*="title"]']);
+            const location = jsonLd?.address?.streetAddress || jsonLd?.address?.addressLocality || textFrom($, ['[class*="location" i]', '[data-testid*="location" i]', '[class*="address"]', '[data-cy*="location"]']);
+            const city = jsonLd?.address?.addressLocality || jsonLd?.address?.addressRegion || textFrom($, ['[class*="city"]', '[data-cy*="city"]']) || null;
+            const description_html = jsonLd?.description || htmlFrom($, ['[class*="description" i]', '[data-testid*="description" i]', '.listing-description', '.description', '[class*="detail"]', '[data-cy*="description"]']);
             const description_text = cleanText(description_html);
 
             const price = numberFrom(priceRaw);
@@ -209,8 +209,7 @@ async function main() {
                 city: city || null,
                 property_type: property_type || null,
                 purpose: purpose || null,
-                description_html: description_html || null,
-                description_text: description_text || null,
+                Description: description_text || null,
                 url: pageUrl,
                 source: 'zameen.com',
             };

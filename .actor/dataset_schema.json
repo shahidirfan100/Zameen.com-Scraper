@@ -17,6 +17,7 @@
           "city",
           "purpose",
           "property_type",
+          "Description",
           "url"
         ]
       },

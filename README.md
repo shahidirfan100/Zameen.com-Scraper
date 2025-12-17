@@ -72,8 +72,7 @@ Records saved to the dataset follow this normalized structure:
 	"city": "Islamabad",
 	"property_type": "house",
 	"purpose": "sale",
-	"description_html": "<p>...listing description...</p>",
-	"description_text": "...plain text...",
+	"Description": "...plain text description...",
 	"url": "https://www.zameen.com/...,",
 	"source": "zameen.com"
 }
