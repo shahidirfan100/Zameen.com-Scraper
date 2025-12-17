@@ -1,0 +1,78 @@
+{
+  "actorSpecification": 1,
+  "fields": {},
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "title",
+          "price",
+          "currency",
+          "bedrooms",
+          "bathrooms",
+          "area",
+          "area_unit",
+          "location",
+          "city",
+          "purpose",
+          "property_type",
+          "url"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "title": {
+            "label": "Listing",
+            "format": "text"
+          },
+          "price": {
+            "label": "Price",
+            "format": "text"
+          },
+          "currency": {
+            "label": "Currency",
+            "format": "text"
+          },
+          "bedrooms": {
+            "label": "Beds",
+            "format": "text"
+          },
+          "bathrooms": {
+            "label": "Baths",
+            "format": "text"
+          },
+          "area": {
+            "label": "Area",
+            "format": "text"
+          },
+          "area_unit": {
+            "label": "Unit",
+            "format": "text"
+          },
+          "location": {
+            "label": "Location",
+            "format": "text"
+          },
+          "city": {
+            "label": "City",
+            "format": "text"
+          },
+          "purpose": {
+            "label": "Purpose",
+            "format": "text"
+          },
+          "property_type": {
+            "label": "Type",
+            "format": "text"
+          },
+          "url": {
+            "label": "URL",
+            "format": "link"
+          }
+        }
+      }
+    }
+  }
+}

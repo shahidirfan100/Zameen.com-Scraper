@@ -1,0 +1,15 @@
+{
+  "name": "zameen-property-scraper",
+  "version": "1.0.0",
+  "description": "Apify actor for scraping Zameen.com property listings via lightweight HTTP + CheerioCrawler.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.js"
+  },
+  "dependencies": {
+    "apify": "^3.4.5",
+    "crawlee": "^3.15.3",
+    "cheerio": "^1.0.0-rc.12",
+    "got-scraping": "^4.1.2"
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "title": "Zameen.com Property Scraper",
+  "description": "Scrape property listings from Zameen.com listing pages. Provide one or more listing URLs (area, project, or search pages). The actor paginates and opens detail pages for richer data.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrls": {
+      "title": "Start URLs",
+      "type": "array",
+      "description": "Array of Zameen.com listing URLs (area/project/search).",
+      "editor": "stringList",
+      "prefill": ["https://www.zameen.com/Homes/Islamabad_DHA_Defence-3188-1.html"]
+    },
+    "keyword": {
+      "title": "Keyword",
+      "type": "string",
+      "description": "Search keyword for properties (e.g., 'house', 'apartment', '3 marla').",
+      "editor": "textfield"
+    },
+    "location": {
+      "title": "Location",
+      "type": "string",
+      "description": "Location filter (e.g., 'Islamabad', 'Lahore', 'DHA Defence').",
+      "editor": "textfield"
+    },
+    "results_wanted": {
+      "title": "Maximum listings",
+      "type": "integer",
+      "description": "Maximum number of listings to collect across all pages.",
+      "minimum": 1,
+      "default": 100,
+      "editor": "number"
+    },
+    "max_pages": {
+      "title": "Pagination limit",
+      "type": "integer",
+      "description": "Safety cap on how many listing pages to open per start URL.",
+      "minimum": 1,
+      "default": 20,
+      "editor": "number"
+    },
+    "scrapeDetails": {
+      "title": "Open detail pages",
+      "type": "boolean",
+      "description": "If enabled, actor opens each listing detail page for full data (recommended).",
+      "default": true,
+      "editor": "checkbox"
+    },
+    "proxyConfiguration": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "Use Apify Proxy to reduce blocking. Data center works; residential is optional for heavy runs.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": true
+      }
+    }
+  },
+  "required": [],
+  "additionalProperties": false
+}
