@@ -1,26 +1,34 @@
 {
   "title": "Zameen.com Property Scraper",
-  "description": "Scrape property listings from Zameen.com listing pages. Provide one or more listing URLs (area, project, or search pages). The actor paginates and opens detail pages for richer data.",
+  "description": "Scrape property listings from Zameen.com canonical listing pages (recommended). If you don’t have a listing URL, provide `location + keyword` and the actor will resolve a canonical listing URL (avoids /search which often returns 503).",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
     "startUrls": {
       "title": "Start URLs",
       "type": "array",
-      "description": "Array of Zameen.com listing URLs (area/project/search).",
+      "description": "Array of Zameen.com LISTING URLs (recommended). Use canonical listing pages like https://www.zameen.com/Homes/Lahore-1-1.html or https://www.zameen.com/Homes/Lahore_Bahria_Town-509-1.html (avoid /search which often returns 503).",
       "editor": "stringList",
-      "prefill": ["https://www.zameen.com/Homes/Islamabad_DHA_Defence-3188-1.html"]
+      "prefill": ["https://www.zameen.com/Homes/Pakistan-1-1.html"]
+    },
+    "category": {
+      "title": "Category",
+      "type": "string",
+      "description": "Which Zameen category to resolve when using keyword+location (ignored when using startUrls).",
+      "editor": "select",
+      "enum": ["Homes", "Plots", "Commercial"],
+      "default": "Homes"
     },
     "keyword": {
       "title": "Keyword",
       "type": "string",
-      "description": "Search keyword for properties (e.g., 'house', 'apartment', '3 marla').",
+      "description": "Area/development keyword to resolve within the city (e.g., 'Bahria Town', 'DHA', 'G-13').",
       "editor": "textfield"
     },
     "location": {
       "title": "Location",
       "type": "string",
-      "description": "Location filter (e.g., 'Islamabad', 'Lahore', 'DHA Defence').",
+      "description": "City name (e.g., 'Lahore', 'Islamabad', 'Karachi'). Used together with keyword to build a canonical listing URL.",
       "editor": "textfield"
     },
     "results_wanted": {

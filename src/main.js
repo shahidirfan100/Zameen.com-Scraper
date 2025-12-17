@@ -1,11 +1,19 @@
 import { Actor, log } from 'apify';
-import { Dataset, HttpCrawler } from 'crawlee';
+import { Dataset, HttpCrawler, log as crawleeLog } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 
-const DEFAULT_START_URL = 'https://www.zameen.com/Homes/Islamabad_DHA_Defence-3188-1.html';
+// Broad listing page that reliably contains `window.state` + Algolia config.
+const DEFAULT_START_URL = 'https://www.zameen.com/Homes/Pakistan-1-1.html';
+// Lightweight page used only to resolve city/location slugs (avoid /search which is often 503).
+const BOOTSTRAP_URL = 'https://www.zameen.com/';
 const USE_ALGOLIA_API = true;
-const MAX_CONCURRENCY = 10;
-const MAX_REQUESTS_PER_MINUTE = 300;
+const MAX_CONCURRENCY = 2;
+const MAX_REQUESTS_PER_MINUTE = 120;
+const REQUEST_TIMEOUT_MS = 60000;
+
+// Reduce log noise (Apify platform will still print container/system logs).
+crawleeLog.setLevel(crawleeLog.LEVELS.ERROR);
+log.setLevel(log.LEVELS.WARNING);
 
 const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -39,6 +47,117 @@ const isPropertyDetailUrl = (urlString) => {
     if (!urlString) return false;
     const u = String(urlString);
     return /^https?:\/\/(?:www\.)?zameen\.com\/Property\/.+-\d+\.html(?:$|\?)/i.test(u);
+};
+
+const extractExternalIdFromPropertyUrl = (urlString) => {
+    const u = String(urlString || '');
+    const match = u.match(/-(\d+)(?:-\d+){1,2}\.html(?:$|\?)/i);
+    return match?.[1] ? String(match[1]) : null;
+};
+
+const normalizeForMatch = (value) =>
+    String(value || '')
+        .toLowerCase()
+        .replace(/[_-]+/g, ' ')
+        .replace(/[^a-z0-9\s]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+const normalizeCategory = (value) => {
+    const v = String(value || '').trim().toLowerCase();
+    if (v === 'plots' || v === 'plot') return 'Plots';
+    if (v === 'commercial' || v === 'com') return 'Commercial';
+    if (v === 'homes' || v === 'home') return 'Homes';
+    return null;
+};
+
+const inferCategorySegment = (keyword) => {
+    const k = normalizeForMatch(keyword);
+    if (/\b(plot|plots|land)\b/i.test(k)) return 'Plots';
+    if (/\b(commercial|shop|office|warehouse)\b/i.test(k)) return 'Commercial';
+    return 'Homes';
+};
+
+const collectLocationsFromState = (state, maxNodes = 150000, maxLocations = 60000) => {
+    const bySlug = new Map();
+    const stack = [state];
+    let visited = 0;
+
+    const isLocationLike = (obj) =>
+        obj &&
+        typeof obj === 'object' &&
+        typeof obj.name === 'string' &&
+        typeof obj.slug === 'string' &&
+        obj.slug.startsWith('/') &&
+        (typeof obj.externalID === 'string' || typeof obj.externalID === 'number');
+
+    while (stack.length && visited < maxNodes && bySlug.size < maxLocations) {
+        const node = stack.pop();
+        visited++;
+        if (!node) continue;
+        if (Array.isArray(node)) {
+            for (const item of node) {
+                if (isLocationLike(item)) {
+                    const slug = String(item.slug);
+                    if (!bySlug.has(slug)) bySlug.set(slug, item);
+                } else if (item && typeof item === 'object') {
+                    stack.push(item);
+                }
+                if (bySlug.size >= maxLocations) break;
+            }
+            continue;
+        }
+        if (typeof node !== 'object') continue;
+        for (const v of Object.values(node)) {
+            if (v && typeof v === 'object') stack.push(v);
+        }
+    }
+
+    return [...bySlug.values()];
+};
+
+const resolveBestLocation = ({ locations, combinedQuery, cityHint }) => {
+    const q = normalizeForMatch(combinedQuery);
+    const tokens = q.split(' ').filter(Boolean);
+    const cityTokens = normalizeForMatch(cityHint).split(' ').filter(Boolean);
+    if (!tokens.length) return null;
+
+    const scoreOne = (loc) => {
+        const name = normalizeForMatch(loc?.name);
+        const hierarchyPath = normalizeForMatch(loc?.hierarchyPath || '');
+        const hierarchyNames = Array.isArray(loc?.hierarchy)
+            ? normalizeForMatch(loc.hierarchy.map((h) => h?.name).filter(Boolean).join(' '))
+            : '';
+
+        const hay = `${name} ${hierarchyPath} ${hierarchyNames}`.trim();
+        if (!hay) return 0;
+
+        let score = 0;
+        if (name === q) score += 200;
+        if (hay === q) score += 150;
+        if (name.startsWith(q)) score += 120;
+        if (hay.includes(q)) score += 80;
+
+        const allTokensMatch = tokens.every((t) => hay.includes(t));
+        if (allTokensMatch) score += 80;
+
+        const cityMatch = cityTokens.length && cityTokens.every((t) => hay.includes(t));
+        if (cityMatch) score += 40;
+
+        if (typeof loc?.level === 'number') score += Math.min(30, loc.level * 3);
+        return score;
+    };
+
+    let best = null;
+    let bestScore = 0;
+    for (const loc of locations) {
+        const s = scoreOne(loc);
+        if (s > bestScore) {
+            bestScore = s;
+            best = loc;
+        }
+    }
+    return bestScore >= 120 ? best : null;
 };
 
 const inferListPageNoFromUrl = (urlString) => {
@@ -244,6 +363,69 @@ const looksBlocked = (html) => {
     );
 };
 
+const parseJsonLdBlocks = ($) => {
+    const raw = [];
+    $('script[type="application/ld+json"]').each((_, el) => {
+        const txt = $(el).text();
+        const parsed = safeParseJson(txt);
+        if (parsed) raw.push(parsed);
+    });
+
+    const flattened = [];
+    const flattenInto = (node) => {
+        if (!node) return;
+        if (Array.isArray(node)) return node.forEach(flattenInto);
+        if (node && typeof node === 'object') {
+            flattened.push(node);
+            if (Array.isArray(node['@graph'])) node['@graph'].forEach(flattenInto);
+        }
+    };
+    raw.forEach(flattenInto);
+
+    // De-dup by stable stringification (best-effort).
+    const seen = new Set();
+    const unique = [];
+    for (const b of flattened) {
+        let key;
+        try { key = JSON.stringify(b).slice(0, 500); } catch { key = String(b?.['@type'] || 'obj'); }
+        if (seen.has(key)) continue;
+        seen.add(key);
+        unique.push(b);
+    }
+    return unique;
+};
+
+const pickJsonLdListing = (jsonLdBlocks) => {
+    const blocks = Array.isArray(jsonLdBlocks) ? jsonLdBlocks : [];
+    const scoreOne = (obj) => {
+        if (!obj || typeof obj !== 'object') return 0;
+        const type = obj['@type'];
+        const typeStr = Array.isArray(type) ? type.join(' ') : String(type || '');
+        const hasOffers = !!obj.offers;
+        const hasName = !!obj.name;
+        const hasDesc = !!obj.description;
+        const hasUrl = !!obj.url;
+        let score = 0;
+        if (/\b(product|offer|place|residence|house|apartment)\b/i.test(typeStr)) score += 30;
+        if (hasOffers) score += 40;
+        if (hasName) score += 20;
+        if (hasDesc) score += 10;
+        if (hasUrl) score += 10;
+        return score;
+    };
+
+    let best = null;
+    let bestScore = 0;
+    for (const b of blocks) {
+        const s = scoreOne(b);
+        if (s > bestScore) {
+            bestScore = s;
+            best = b;
+        }
+    }
+    return bestScore >= 40 ? best : null;
+};
+
 await Actor.init();
 
 async function main() {
@@ -253,6 +435,7 @@ async function main() {
             startUrls,
             keyword = '',
             location = '',
+            category: categoryInput = '',
             results_wanted: RESULTS_WANTED_RAW = 100,
             max_pages: MAX_PAGES_RAW = 20,
             scrapeDetails = true,
@@ -262,17 +445,9 @@ async function main() {
         const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : Number.MAX_SAFE_INTEGER;
         const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 20;
 
-        const buildSearchUrl = (kw, loc) => {
-            const u = new URL('https://www.zameen.com/search/');
-            if (kw) u.searchParams.set('search', String(kw).trim());
-            if (loc) u.searchParams.set('location', String(loc).trim());
-            return u.href;
-        };
-
         const initial = [];
         if (Array.isArray(startUrls) && startUrls.length) initial.push(...startUrls.map(String));
-        if (!initial.length && (keyword || location)) initial.push(buildSearchUrl(keyword, location));
-        if (!initial.length) {
+        if (!initial.length && !String(keyword).trim() && !String(location).trim()) {
             log.warning(`No start URLs or keyword/location provided; falling back to ${DEFAULT_START_URL}`);
             initial.push(DEFAULT_START_URL);
         }
@@ -285,14 +460,40 @@ async function main() {
         const MAX_RESERVATIONS = scrapeDetails ? RESULTS_WANTED + Math.min(50, Math.ceil(RESULTS_WANTED * 0.2)) : RESULTS_WANTED;
         const seenDetail = new Set(); // externalID or URL
         const seenPages = new Set(); // list/API pagination dedupe
+        const runStats = {
+            blockedList: 0,
+            blockedDetail: 0,
+            http403: 0,
+            http429: 0,
+            queuedDetails: 0,
+            pushedFull: 0,
+            pushedFallback: 0,
+        };
+
+        const maybeLogBlocked = (type, url) => {
+            const key = type === 'LIST' ? 'blockedList' : 'blockedDetail';
+            runStats[key] += 1;
+            const count = runStats[key];
+
+            // Log first few examples, then only occasional rollups.
+            if (count <= 3) {
+                log.warning(`Blocked/captcha-like response on ${type}: ${url}`);
+                return;
+            }
+            if (count % 25 === 0) {
+                log.warning(`Blocked/captcha-like responses so far: list=${runStats.blockedList}, detail=${runStats.blockedDetail}`);
+            }
+        };
 
         const enqueueDetail = async ({ url, externalId, partial }) => {
             if (!isPropertyDetailUrl(url)) return;
-            const uniqueKey = externalId ? `detail:${externalId}` : url;
+            const finalExternalId = externalId || extractExternalIdFromPropertyUrl(url);
+            const uniqueKey = finalExternalId ? `detail:${finalExternalId}` : url;
             if (seenDetail.has(uniqueKey)) return;
             if (reserved >= MAX_RESERVATIONS) return;
             seenDetail.add(uniqueKey);
             reserved++;
+            runStats.queuedDetails++;
             await requestQueue.addRequest({ url, userData: { label: 'DETAIL', partial }, uniqueKey });
         };
 
@@ -327,28 +528,43 @@ async function main() {
             return true;
         };
 
-        for (const uRaw of initial) {
-            const u = String(uRaw);
-            if (!isZameenUrl(u) && !extractZameenPropertyUrlFromText(u)) {
-                log.warning(`Skipping non-Zameen start URL: ${u}`);
-                continue;
-            }
-            const pageNo = isPropertyDetailUrl(u) ? 1 : inferListPageNoFromUrl(u);
+        // If user provided keyword/location without startUrls, avoid /search (often 503) by resolving to a canonical listing URL.
+        if ((!Array.isArray(startUrls) || !startUrls.length) && (String(keyword).trim() || String(location).trim())) {
             await requestQueue.addRequest({
-                url: isZameenUrl(u) ? u : extractZameenPropertyUrlFromText(u),
-                userData: isPropertyDetailUrl(u) ? { label: 'DETAIL' } : { label: 'LIST', pageNo },
-                uniqueKey: isZameenUrl(u) ? u : extractZameenPropertyUrlFromText(u),
+                url: BOOTSTRAP_URL,
+                userData: {
+                    label: 'BOOTSTRAP',
+                    keyword: String(keyword || ''),
+                    location: String(location || ''),
+                    category: normalizeCategory(categoryInput) || null,
+                },
+                uniqueKey: `bootstrap:${normalizeForMatch(location)}|${normalizeForMatch(keyword)}`,
             });
+        } else {
+            for (const uRaw of initial) {
+                const u = String(uRaw);
+                if (!isZameenUrl(u) && !extractZameenPropertyUrlFromText(u)) {
+                    log.warning(`Skipping non-Zameen start URL: ${u}`);
+                    continue;
+                }
+                const pageNo = isPropertyDetailUrl(u) ? 1 : inferListPageNoFromUrl(u);
+                const normalizedUrl = isZameenUrl(u) ? u : extractZameenPropertyUrlFromText(u);
+                await requestQueue.addRequest({
+                    url: normalizedUrl,
+                    userData: isPropertyDetailUrl(normalizedUrl) ? { label: 'DETAIL' } : { label: 'LIST', pageNo },
+                    uniqueKey: normalizedUrl,
+                });
+            }
         }
 
         const crawler = new HttpCrawler({
             requestQueue,
             proxyConfiguration: proxyConf,
             useSessionPool: true,
-            maxRequestRetries: 6,
+            maxRequestRetries: 4,
             maxConcurrency: MAX_CONCURRENCY,
             maxRequestsPerMinute: MAX_REQUESTS_PER_MINUTE,
-            requestHandlerTimeoutSecs: 180,
+            requestHandlerTimeoutSecs: 240,
             preNavigationHooks: [
                 async ({ request, session }, gotOptions) => {
                     gotOptions.headers ??= {};
@@ -361,23 +577,117 @@ async function main() {
                         gotOptions.headers.accept ??= 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8';
                     }
                     gotOptions.followRedirect = true;
-                    gotOptions.timeout = { request: 30000 };
+                    // Avoid huge HTML snippets in error logs by handling status codes ourselves.
+                    gotOptions.throwHttpErrors = false;
+                    gotOptions.timeout = { request: REQUEST_TIMEOUT_MS };
                 },
             ],
             async requestHandler({ request, body, response, session, log: crawlerLog }) {
                 const label = request.userData?.label || 'LIST';
                 const pageNo = request.userData?.pageNo || 1;
                 const bodyText = body?.toString?.() || '';
+                const statusCode = response?.statusCode || 0;
 
-                if ((response?.statusCode === 403 || response?.statusCode === 429) && session) {
-                    crawlerLog.warning(`HTTP ${response.statusCode} for ${request.url} (retiring session)`);
-                    session.retire();
+                // Sanitize retries/errors (no HTML payloads in error messages).
+                if (statusCode >= 500) {
+                    if (session) session.retire();
+                    throw new Error(`HTTP ${statusCode} on ${label}`);
+                }
+                if (statusCode === 403 || statusCode === 429) {
+                    if (statusCode === 403) runStats.http403++;
+                    if (statusCode === 429) runStats.http429++;
+                    if (session) session.retire();
+                    throw new Error(`HTTP ${statusCode} on ${label}`);
+                }
+
+                if (label === 'BOOTSTRAP') {
+                    const state = parseWindowState(bodyText);
+                    if (!state || typeof state !== 'object') {
+                        log.warning('Failed to bootstrap (missing window.state). Provide `startUrls` instead.');
+                        return;
+                    }
+
+                    const kw = String(request.userData?.keyword || '');
+                    const loc = String(request.userData?.location || '');
+                    const locations = collectLocationsFromState(state);
+
+                    const category = request.userData?.category || normalizeCategory(categoryInput) || inferCategorySegment(kw);
+                    const cityBest = resolveBestLocation({ locations, combinedQuery: loc, cityHint: loc });
+
+                    // Step 1: resolve city page (e.g., /Homes/Lahore-1-1.html) then resolve area within that city.
+                    if (cityBest?.slug) {
+                        const citySlugNoSlash = String(cityBest.slug).replace(/^\//, '');
+                        const cityUrl = `https://www.zameen.com/${category}/${citySlugNoSlash}-1.html`;
+
+                        if (String(kw).trim()) {
+                            await requestQueue.addRequest({
+                                url: cityUrl,
+                                userData: { label: 'BOOTSTRAP_CITY', keyword: kw, location: loc, category },
+                                uniqueKey: `bootstrapCity:${category}:${citySlugNoSlash}:${normalizeForMatch(kw)}`,
+                            });
+                        } else {
+                            await requestQueue.addRequest({
+                                url: cityUrl,
+                                userData: { label: 'LIST', pageNo: 1 },
+                                uniqueKey: cityUrl,
+                            });
+                        }
+                        return;
+                    }
+
+                    // Step 2 (fallback): resolve directly from this bootstrap page.
+                    const combined = `${loc} ${kw}`.trim();
+                    const bestDirect =
+                        resolveBestLocation({ locations, combinedQuery: combined, cityHint: loc }) ||
+                        resolveBestLocation({ locations, combinedQuery: loc, cityHint: loc }) ||
+                        resolveBestLocation({ locations, combinedQuery: kw, cityHint: loc });
+
+                    if (!bestDirect?.slug) {
+                        log.warning(`Could not resolve keyword/location to a Zameen listing page. Provide \`startUrls\` instead (keyword="${kw}", location="${loc}").`);
+                        return;
+                    }
+
+                    const slugNoSlash = String(bestDirect.slug).replace(/^\//, '');
+                    const listingUrl = `https://www.zameen.com/${category}/${slugNoSlash}-1.html`;
+                    await requestQueue.addRequest({ url: listingUrl, userData: { label: 'LIST', pageNo: 1 }, uniqueKey: listingUrl });
+                    return;
+                }
+
+                if (label === 'BOOTSTRAP_CITY') {
+                    const state = parseWindowState(bodyText);
+                    if (!state || typeof state !== 'object') {
+                        log.warning('Failed to bootstrap city page (missing window.state). Provide `startUrls` instead.');
+                        return;
+                    }
+
+                    const kw = String(request.userData?.keyword || '');
+                    const loc = String(request.userData?.location || '');
+                    const category = String(request.userData?.category || inferCategorySegment(kw));
+
+                    const locations = collectLocationsFromState(state);
+                    const combined = `${loc} ${kw}`.trim();
+                    const best =
+                        resolveBestLocation({ locations, combinedQuery: combined, cityHint: loc }) ||
+                        resolveBestLocation({ locations, combinedQuery: kw, cityHint: loc }) ||
+                        resolveBestLocation({ locations, combinedQuery: loc, cityHint: loc });
+
+                    if (!best?.slug) {
+                        // Fallback: just treat this city page as the listing page.
+                        await requestQueue.addRequest({ url: request.url, userData: { label: 'LIST', pageNo: 1 }, uniqueKey: `list:${request.url}` });
+                        return;
+                    }
+
+                    const slugNoSlash = String(best.slug).replace(/^\//, '');
+                    const listingUrl = `https://www.zameen.com/${category}/${slugNoSlash}-1.html`;
+                    await requestQueue.addRequest({ url: listingUrl, userData: { label: 'LIST', pageNo: 1 }, uniqueKey: listingUrl });
+                    return;
                 }
 
                 if (label === 'LIST') {
-                    if (looksBlocked(bodyText) && session) {
-                        crawlerLog.warning(`Blocked/captcha-like response on LIST ${request.url} (retiring session)`);
-                        session.retire();
+                    if (looksBlocked(bodyText)) {
+                        maybeLogBlocked('LIST', request.url);
+                        if (session) session.retire();
+                        throw new Error('Blocked/captcha-like response');
                     }
 
                     const $ = cheerioLoad(bodyText);
@@ -428,7 +738,8 @@ async function main() {
                     const localSeen = new Set();
                     const uniqueCandidates = [];
                     for (const c of candidates) {
-                        const externalId = c?.hit?.externalID ? String(c.hit.externalID) : null;
+                        const externalId =
+                            c?.hit?.externalID ? String(c.hit.externalID) : extractExternalIdFromPropertyUrl(c?.url);
                         const key = externalId ? `detail:${externalId}` : c?.url;
                         if (!key) continue;
                         if (localSeen.has(key)) continue;
@@ -438,11 +749,9 @@ async function main() {
                     }
                     const toQueue = uniqueCandidates.slice(0, Math.max(0, remaining));
 
-                    crawlerLog.info(`LIST page ${pageNo}: discovered=${uniqueCandidates.length}, remaining=${remaining}, willQueue=${toQueue.length}`);
-
                     if (scrapeDetails) {
                         for (const { url, hit } of toQueue) {
-                            const externalId = hit?.externalID ? String(hit.externalID) : null;
+                            const externalId = hit?.externalID ? String(hit.externalID) : extractExternalIdFromPropertyUrl(url);
                             const { city, location: locationText } = locationFromHierarchy(hit?.location);
                             const areaNormalized = normalizeArea(hit?.area);
                             const partial = hit
@@ -472,14 +781,12 @@ async function main() {
                     }
 
                     if (reserved < MAX_RESERVATIONS && pageNo < MAX_PAGES) {
-                    const enqueued = await enqueueNextAlgoliaPageIfNeeded(algoliaConfig, pageNo + 1);
-                    if (!enqueued) {
-                        const nextHref = $('a[rel="next"], link[rel="next"]').attr('href');
-                        const next = normalizeUrl(nextHref, request.url);
+                        const enqueued = await enqueueNextAlgoliaPageIfNeeded(algoliaConfig, pageNo + 1);
+                        if (!enqueued) {
+                            const nextHref = $('a[rel="next"], link[rel="next"]').attr('href');
+                            const next = normalizeUrl(nextHref, request.url);
                             if (next) {
                                 await requestQueue.addRequest({ url: next, userData: { label: 'LIST', pageNo: pageNo + 1 }, uniqueKey: next });
-                            } else {
-                                crawlerLog.info(`LIST page ${pageNo}: no next page detected`);
                             }
                         }
                     }
@@ -501,8 +808,8 @@ async function main() {
                     const uniqueHits = [];
                     const localSeen = new Set();
                     for (const hit of hits) {
-                        const externalId = hit?.externalID ? String(hit.externalID) : null;
                         const url = toDetailUrlFromHit(hit);
+                        const externalId = hit?.externalID ? String(hit.externalID) : extractExternalIdFromPropertyUrl(url);
                         const key = externalId ? `detail:${externalId}` : url;
                         if (!key) continue;
                         if (localSeen.has(key)) continue;
@@ -511,14 +818,13 @@ async function main() {
                         uniqueHits.push(hit);
                     }
                     const toQueue = uniqueHits.slice(0, Math.max(0, remaining));
-                    crawlerLog.info(`ALGOLIA page ${pageNo}: hits=${hits.length}, unique=${uniqueHits.length}, remaining=${remaining}, willQueue=${toQueue.length}`);
 
                     if (scrapeDetails) {
                         for (const hit of toQueue) {
                             const url = toDetailUrlFromHit(hit);
                             if (!url) continue;
 
-                            const externalId = hit?.externalID ? String(hit.externalID) : null;
+                            const externalId = hit?.externalID ? String(hit.externalID) : extractExternalIdFromPropertyUrl(url);
                             const { city, location: locationText } = locationFromHierarchy(hit?.location);
                             const areaNormalized = normalizeArea(hit?.area);
                             const partial = {
@@ -557,9 +863,10 @@ async function main() {
                     if (saved >= RESULTS_WANTED) return;
                     if (!isPropertyDetailUrl(request.url)) return;
 
-                    if (looksBlocked(bodyText) && session) {
-                        crawlerLog.warning(`Blocked/captcha-like response on DETAIL ${request.url} (retiring session)`);
-                        session.retire();
+                    if (looksBlocked(bodyText)) {
+                        maybeLogBlocked('DETAIL', request.url);
+                        if (session) session.retire();
+                        throw new Error('Blocked/captcha-like response');
                     }
 
                     const state = parseWindowState(bodyText);
@@ -590,39 +897,78 @@ async function main() {
 
                         await Dataset.pushData(item);
                         saved++;
+                        runStats.pushedFull++;
                         return;
                     }
 
-                    // HTML fallback (best-effort) if window.state is missing.
+                    // JSON-LD / HTML fallback (best-effort) if window.state is missing.
                     const $ = cheerioLoad(bodyText);
+                    const jsonLd = pickJsonLdListing(parseJsonLdBlocks($));
+                    const jsonLdOffers = jsonLd?.offers && typeof jsonLd.offers === 'object'
+                        ? (Array.isArray(jsonLd.offers) ? jsonLd.offers[0] : jsonLd.offers)
+                        : null;
+
                     const title = $('h1').first().text().trim() || $('title').text().trim() || partial?.title || null;
-                    const description = cleanText(partial?.Description || partial?.description || '');
+                    const description = cleanText(jsonLd?.description || partial?.Description || partial?.description || '');
+                    const jsonLdCity = jsonLd?.address?.addressLocality || jsonLd?.address?.addressRegion || null;
+                    const jsonLdLocation = jsonLd?.address?.streetAddress || jsonLd?.address?.addressLocality || null;
+                    const jsonLdUrl = jsonLd?.url || null;
+                    const jsonLdBedrooms = pickNumber(jsonLd?.numberOfRooms) ?? null;
+                    const jsonLdBathrooms = pickNumber(jsonLd?.numberOfBathroomsTotal) ?? null;
+
+                    const jsonLdFloorSizeValue = jsonLd?.floorSize?.value ?? null;
+                    const jsonLdFloorSizeUnit = String(jsonLd?.floorSize?.unitCode || jsonLd?.floorSize?.unitText || '').toLowerCase();
+                    const jsonLdArea =
+                        jsonLdFloorSizeValue !== null && jsonLdFloorSizeValue !== undefined ? pickNumber(jsonLdFloorSizeValue) : null;
+                    const jsonLdAreaUnit = jsonLdFloorSizeUnit
+                        ? (jsonLdFloorSizeUnit.includes('mtk') || jsonLdFloorSizeUnit.includes('sqm') ? 'sqm'
+                            : (jsonLdFloorSizeUnit.includes('sqf') || jsonLdFloorSizeUnit.includes('sqft') ? 'sqft' : null))
+                        : null;
                     const item = {
-                        title: title || null,
-                        price: partial?.price ?? null,
-                        currency: partial?.currency || 'PKR',
-                        bedrooms: partial?.bedrooms ?? null,
-                        bathrooms: partial?.bathrooms ?? null,
-                        area: partial?.area ?? null,
-                        area_unit: partial?.area_unit || null,
-                        location: partial?.location || null,
-                        city: partial?.city || null,
+                        title: jsonLd?.name || title || null,
+                        price: pickNumber(jsonLdOffers?.price, partial?.price) ?? null,
+                        currency: String(jsonLdOffers?.priceCurrency || partial?.currency || 'PKR'),
+                        bedrooms: pickNumber(partial?.bedrooms, jsonLdBedrooms) ?? null,
+                        bathrooms: pickNumber(partial?.bathrooms, jsonLdBathrooms) ?? null,
+                        area: partial?.area ?? jsonLdArea ?? null,
+                        area_unit: partial?.area_unit || jsonLdAreaUnit || null,
+                        location: partial?.location || jsonLdLocation || null,
+                        city: partial?.city || jsonLdCity || null,
                         property_type: partial?.property_type || null,
                         purpose: partial?.purpose || null,
                         Description: description || null,
-                        url: request.url,
+                        url: jsonLdUrl || request.url,
                         source: 'zameen.com',
-                        external_id: partial?.external_id || null,
+                        external_id: partial?.external_id || extractExternalIdFromPropertyUrl(request.url) || null,
                     };
 
                     await Dataset.pushData(item);
                     saved++;
+                    runStats.pushedFallback++;
                 }
+            },
+            failedRequestHandler: async ({ request, error }) => {
+                const label = request.userData?.label || 'LIST';
+                if (label === 'DETAIL') {
+                    const partial = request.userData?.partial || null;
+                    if (partial && typeof partial === 'object') {
+                        await Dataset.pushData({ ...partial, Description: partial.Description || null });
+                        saved++;
+                        runStats.pushedFallback++;
+                        return;
+                    }
+                }
+
+                // Keep logs minimal and actionable.
+                log.warning(`Request failed after retries: ${label} ${request.url} (${error?.message || 'unknown error'})`);
             },
         });
 
         await crawler.run();
-        log.info(`Finished. Saved ${saved} items`);
+        log.warning(
+            `Finished. Saved ${saved} items (full=${runStats.pushedFull}, fallback=${runStats.pushedFallback}). ` +
+            `Blocked(list=${runStats.blockedList}, detail=${runStats.blockedDetail}) HTTP(403=${runStats.http403}, 429=${runStats.http429}) queuedDetails=${runStats.queuedDetails}`
+        );
     } finally {
         await Actor.exit();
     }
