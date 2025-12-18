@@ -354,6 +354,8 @@ const buildAlgoliaRequest = ({ appId, apiKey, indexName, filtersStr, pageNo, hit
 
 const looksBlocked = (html) => {
     const t = String(html || '').toLowerCase();
+    const hasStateMarker = t.includes('window.state');
+    if (hasStateMarker) return false; // Prefer parsing state even if recaptcha strings are present.
     return (
         t.includes('recaptcha') ||
         t.includes('g-recaptcha') ||
@@ -561,15 +563,21 @@ async function main() {
             requestQueue,
             proxyConfiguration: proxyConf,
             useSessionPool: true,
-            maxRequestRetries: 4,
+            maxRequestRetries: 3,
             maxConcurrency: MAX_CONCURRENCY,
             maxRequestsPerMinute: MAX_REQUESTS_PER_MINUTE,
-            requestHandlerTimeoutSecs: 240,
+            requestHandlerTimeoutSecs: 180,
             preNavigationHooks: [
                 async ({ request, session }, gotOptions) => {
                     gotOptions.headers ??= {};
                     gotOptions.headers['user-agent'] = pickUserAgent(session);
                     gotOptions.headers['accept-language'] = 'en-US,en;q=0.9';
+                    gotOptions.headers['accept-encoding'] = 'gzip, deflate, br';
+                    gotOptions.headers['upgrade-insecure-requests'] = '1';
+                    gotOptions.headers['sec-ch-ua'] = '"Chromium";v="120", "Not?A_Brand";v="24"';
+                    gotOptions.headers['sec-ch-ua-mobile'] = '?0';
+                    gotOptions.headers['sec-ch-ua-platform'] = '"Windows"';
+                    gotOptions.headers['referer'] = 'https://www.zameen.com/';
                     const label = request.userData?.label || 'LIST';
                     if (label === 'ALGOLIA') {
                         gotOptions.headers.accept ??= 'application/json,text/plain,*/*';
@@ -684,14 +692,14 @@ async function main() {
                 }
 
                 if (label === 'LIST') {
-                    if (looksBlocked(bodyText)) {
+                    const state = parseWindowState(bodyText);
+                    if (!state && looksBlocked(bodyText)) {
                         maybeLogBlocked('LIST', request.url);
                         if (session) session.retire();
-                        throw new Error('Blocked/captcha-like response');
+                        return;
                     }
 
                     const $ = cheerioLoad(bodyText);
-                    const state = parseWindowState(bodyText);
 
                     const hits = state?.algolia?.content?.hits;
                     const algoliaConfig = state?.algolia
@@ -863,13 +871,12 @@ async function main() {
                     if (saved >= RESULTS_WANTED) return;
                     if (!isPropertyDetailUrl(request.url)) return;
 
-                    if (looksBlocked(bodyText)) {
+                    const state = parseWindowState(bodyText);
+                    if (!state && looksBlocked(bodyText)) {
                         maybeLogBlocked('DETAIL', request.url);
                         if (session) session.retire();
-                        throw new Error('Blocked/captcha-like response');
+                        return;
                     }
-
-                    const state = parseWindowState(bodyText);
                     const data = state?.property?.data;
                     const partial = request.userData?.partial || null;
 
