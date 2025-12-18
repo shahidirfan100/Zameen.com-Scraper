@@ -7,7 +7,8 @@ const DEFAULT_START_URL = 'https://www.zameen.com/Homes/Pakistan-1-1.html';
 // Lightweight page used only to resolve city/location slugs (avoid /search which is often 503).
 const BOOTSTRAP_URL = 'https://www.zameen.com/';
 const USE_ALGOLIA_API = true;
-const MAX_CONCURRENCY = 2;
+// Concurrency tuned for better throughput; RPM limiter keeps it stealthy.
+const MAX_CONCURRENCY = 5;
 const MAX_REQUESTS_PER_MINUTE = 120;
 const REQUEST_TIMEOUT_MS = 60000;
 
